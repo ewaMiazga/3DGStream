@@ -13,3 +13,6 @@ screenshots
 *.out
 __pycache__
 dataset
+discussion_scene
+discussion_scene_distorted
+frame_000000

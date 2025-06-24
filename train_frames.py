@@ -31,7 +31,25 @@ try:
 except ImportError:
     TENSORBOARD_FOUND = False
 
-def training_one_frame(dataset, opt, pipe, load_iteration, testing_iterations, saving_iterations, checkpoint_iterations, checkpoint, debug_from):
+masked_i = 0
+name_of_exp = []
+import matplotlib.pyplot as plt
+
+def render_and_save_gradients(viewpoint_cam, gaussians, i, pipe, background = torch.tensor([0,0,0], dtype=torch.float32, device="cuda")):
+
+    # === Step 1: Create a shallow Gaussian subset based on the mask ===
+    
+    render_pkg = render(viewpoint_cam, gaussians, pipe, background)
+    image, depth, viewspace_point_tensor, visibility_filter, radii = render_pkg["render"], render_pkg["depth"],render_pkg["viewspace_points"], render_pkg["visibility_filter"], render_pkg["radii"]
+
+    from torchvision.utils import save_image
+
+    # Assuming `image` is [3, H, W] and values in [0, 1]
+    save_image(image, f'output_dist_maps/{i}_rendered_image_grad.png')
+
+def training_one_frame(dataset, opt, pipe, load_iteration, testing_iterations, saving_iterations, checkpoint_iterations, checkpoint, debug_from, args):
+    global masked_i
+    masked_i += 1
     start_time=time.time()
     last_s1_res = []
     last_s2_res = []
@@ -65,6 +83,9 @@ def training_one_frame(dataset, opt, pipe, load_iteration, testing_iterations, s
             gaussians.oneupSHdegree()
                      
         # Query the NTC
+        #print("Querying NTC at iteration {}".format(iteration))
+        #print("XYZ shape:", gaussians._xyz.shape)
+        #print("Gaussians fearure dc shape: ", gaussians._features_dc.shape)
         gaussians.query_ntc()
         
         loss = torch.tensor(0.).cuda()
@@ -115,6 +136,11 @@ def training_one_frame(dataset, opt, pipe, load_iteration, testing_iterations, s
             if iteration > opt.densify_from_iter:
                 # Keep track of max radii in image-space for pruning
                 gaussians.max_radii2D[visibility_filter] = torch.max(gaussians.max_radii2D[visibility_filter], radii[visibility_filter])
+                #print("Shape of visibility filter: ", visibility_filter.shape)
+                #print("View space point tensor shape: ", viewspace_point_tensor.shape)
+                #print("Is full of nans: ", torch.isnan(viewspace_point_tensor).any())
+
+                ### Now we add the densification stats and xyz_gradient_accum.mean != 0
                 gaussians.add_densification_stats(viewspace_point_tensor, visibility_filter)
 
             # Optimizer step
@@ -134,9 +160,22 @@ def training_one_frame(dataset, opt, pipe, load_iteration, testing_iterations, s
     # Update Gaussians by NTC
         gaussians.update_by_ntc()
     # Prune, Clone and setting up  
-        gaussians.training_one_frame_s2_setup(opt)
+
+        ### Idea to check where the gaussians with high space-view are in the rendered image
+        # grads = gaussians.xyz_gradient_accum / gaussians.denom
+        # grads[grads.isnan()] = 0.0
+        # grads_norms = torch.norm(grads, dim=-1)
+        # high_grad_mask = grads_norms >= 0.00007
+        # masked_gaus = gaussians.clone_subset(high_grad_mask)
+        # # reneder and save gradients
+        # render_and_save_gradients(viewpoint_cam, masked_gaus, masked_i, pipe, background)
+
+        #print(f"Mean of xyz gaussians before setup: {gaussians.xyz_gradient_accum.mean(dim=0)}") ### != 0 
+        gaussians.training_one_frame_s2_setup(gt_image, image, masked_i, viewpoint_cam, visibility_filter, name_of_exp, pipe, opt, args)
+        #print(f"Mean of xyz gaussians after setup: {gaussians.xyz_gradient_accum.mean(dim=0)}")
         progress_bar = tqdm(range(opt.iterations, opt.iterations + opt.iterations_s2), desc="Training progress of Stage 2")    
     
+
     # Train the new Gaussians
     for iteration in range(opt.iterations + 1, opt.iterations + opt.iterations_s2 + 1):        
         iter_start.record()
@@ -153,16 +192,91 @@ def training_one_frame(dataset, opt, pipe, load_iteration, testing_iterations, s
                 viewpoint_stack = scene.getTrainCameras().copy()
             viewpoint_cam = viewpoint_stack.pop(randint(0, len(viewpoint_stack)-1))
             
-            # Render
+            # # Render OLD
             if (iteration - 1) == debug_from:
-                pipe.debug = True
-            render_pkg = render(viewpoint_cam, gaussians, pipe, background)
-            image, depth, viewspace_point_tensor, visibility_filter, radii = render_pkg["render"], render_pkg["depth"],render_pkg["viewspace_points"], render_pkg["visibility_filter"], render_pkg["radii"]
-            # Loss
-            gt_image = viewpoint_cam.original_image.cuda()
-            Ll1 = l1_loss(image, gt_image)
-            loss += (1.0 - opt.lambda_dssim) * Ll1 + opt.lambda_dssim * (1.0 - ssim(image, gt_image))
+                    pipe.debug = True
+            if not args.new_loss:
+                render_pkg = render(viewpoint_cam, gaussians, pipe, background)
+                image, depth, viewspace_point_tensor, visibility_filter, radii = render_pkg["render"], render_pkg["depth"],render_pkg["viewspace_points"], render_pkg["visibility_filter"], render_pkg["radii"]
+                # Loss
+                gt_image = viewpoint_cam.original_image.cuda()
+                Ll1 = l1_loss(image, gt_image)
+                loss += (1.0 - opt.lambda_dssim) * Ll1 + opt.lambda_dssim * (1.0 - ssim(image, gt_image))
             
+
+
+            ### WORKING RENDERING PATCHES
+            # Render New - localize the gaussian with the highest grad change and use only the patch around it 
+            # grads: [N, 3] — assume already computed
+
+            else: 
+                render_pkg = render(viewpoint_cam, gaussians, pipe, background)
+                image, depth, viewspace_point_tensor, visibility_filter, radii = render_pkg["render"], render_pkg["depth"],render_pkg["viewspace_points"], render_pkg["visibility_filter"], render_pkg["radii"]
+                # Loss
+                gt_image = viewpoint_cam.original_image.cuda()
+
+                #max_gaussian_xyz = gaussians.max_gaussian_xyz
+                max_gaussian_xyzs = gaussians.max_gaussian_xyzs
+
+                def project_xyz_to_screen(xyz, camera):
+                    # Homogeneous coordinates
+                    N = xyz.shape[0]
+                    xyz_h = torch.cat([xyz, torch.ones((N, 1), device=xyz.device)], dim=1)  # [4]
+                    screen_coord = (camera.full_proj_transform.T @ xyz_h.T).T # [4]
+                    screen_coord = screen_coord.clone()
+                    screen_coord = screen_coord / screen_coord[:, 3:4].clone()   # Perspective divide
+                    x_ndc, y_ndc = screen_coord[:, 0], screen_coord[:, 1]  # [-1, 1]
+
+                    # Convert to pixel coords
+                    W, H = camera.image_width, camera.image_height
+                    x = ((x_ndc + 1) / 2 * W).long().clamp(0, W-1)
+                    y = ((y_ndc + 1) / 2 * H).long().clamp(0, H-1)
+                    return x, y
+                
+                x_pixels, y_pixels = project_xyz_to_screen(max_gaussian_xyzs, viewpoint_cam)
+
+                patch_size = 128  # or any small region
+                W, H = viewpoint_cam.image_width, viewpoint_cam.image_height
+                # x_min, x_max = max(0, x_pixel - patch_size//2), min(W, x_pixel + patch_size//2)
+                # y_min, y_max = max(0, y_pixel - patch_size//2), min(H, y_pixel + patch_size//2)
+
+                # attention_mask = torch.zeros((H, W), dtype=torch.bool, device="cuda")
+                # attention_mask[y_min:y_max, x_min:x_max] = True
+
+                attention_mask = torch.zeros((H, W), dtype=torch.bool, device="cuda")
+                for x_pixel, y_pixel in zip(x_pixels, y_pixels):
+                    x_min, x_max = max(0, x_pixel - patch_size // 2), min(W, x_pixel + patch_size // 2)
+                    y_min, y_max = max(0, y_pixel - patch_size // 2), min(H, y_pixel + patch_size // 2)
+                    attention_mask[y_min:y_max, x_min:x_max] = True
+
+                # Expand to 3-channel mask
+                mask3 = attention_mask.unsqueeze(0).expand_as(image)
+
+                masked_render = image * mask3
+                masked_gt = gt_image * mask3
+
+                valid_pixels = attention_mask.sum()
+                if valid_pixels > 0:
+                    Ll1 = torch.abs(masked_render - masked_gt).sum() / valid_pixels
+                else:
+                    Ll1 = torch.tensor(0.0, device=image.device)
+
+                # save masked render and masked ground truth
+                os.makedirs(f'{name_of_exp[0]}/masked', exist_ok = True)
+                save_tensor_img(masked_render, os.path.join(f'{name_of_exp[0]}/masked',f'{masked_i}_masked_rendering2'))
+                save_tensor_img(masked_gt, os.path.join(f'{name_of_exp[0]}/masked',f'{masked_i}_masked_ground_truth2'))
+
+                #Ll1 = l1_loss(masked_render, masked_gt)
+                # local patch loss calculated 
+                ##### CHANGE TO HAVE EQUAL RATIO OF L1 AND SSIM
+                loss += (1.0 - opt.lambda_dssim) * Ll1 + opt.lambda_dssim * (1.0 - ssim(masked_render, masked_gt))
+                #loss += (Ll1 + opt.lambda_dssim * (1.0 - ssim(masked_render, masked_gt)))
+
+                # global loss calculated
+                Ll1 = l1_loss(image, gt_image)
+                loss += (1.0 - opt.lambda_dssim) * Ll1 + opt.lambda_dssim * (1.0 - ssim(image, gt_image))
+
+        
         loss/=opt.batch_size
         loss.backward()
         iter_end.record()
@@ -186,15 +300,22 @@ def training_one_frame(dataset, opt, pipe, load_iteration, testing_iterations, s
                       
             # Densification
             if (iteration - opt.iterations) % opt.densification_interval == 0:
+                #print(f"Mean of xyz gaussians before adding and pruning: {gaussians.xyz_gradient_accum.mean(dim=0)}")
+                #print(f"Adding and pruning gaussians at iteration {iteration}")
                 gaussians.adding_and_prune(opt,scene.cameras_extent)
                              
             # Optimizer step
             if iteration < opt.iterations + opt.iterations_s2:
+                # Check if colors are updated
+                #print("Color before optimizer step: ", gaussians._added_features_dc.mean(dim=0))
+                #print("Rest Color before optmizer step: ", gaussians._added_features_rest.mean(dim=0))
                 gaussians.optimizer.step()
+                #print("Color after optimizer step: ", gaussians._added_features_dc.mean(dim=0))
+                #print("Rest Color after optmizer step: ", gaussians._added_features_rest.mean(dim=0))
                 gaussians.optimizer.zero_grad(set_to_none = True)
     s2_end_time=time.time()
     
-    # 计算总训练时间
+    # 计算总训练时间 - calculate total training time 
     pre_time = s1_start_time - start_time
     s1_time = s1_end_time - s1_start_time
     s2_time = s2_end_time - s1_end_time
@@ -275,7 +396,8 @@ def training_report(tb_writer, iteration, Ll1, Lds, loss, l1_loss, elapsed, test
             tb_writer.add_scalar('total_points', scene.gaussians.get_xyz.shape[0], iteration)
         torch.cuda.empty_cache()
         
-        return {'last_test_psnr':last_test_psnr.cpu().numpy()
+        return {#'last_test_psnr':last_test_psnr.cpu().numpy()
+                  'last_test_psnr':float(last_test_psnr)
                 , 'last_test_image':last_test_image.cpu()
                 , 'last_points_num':scene.gaussians.get_xyz.shape[0]
                 # , 'last_gt':last_gt.cpu()
@@ -288,7 +410,7 @@ def train_one_frame(lp,op,pp,args):
     print("Optimizing " + args.output_path)
     res_dict={}
     if(args.opt_type=='3DGStream'):
-        s1_ress, s2_ress, pre_time, s1_time, s2_time = training_one_frame(lp.extract(args), op.extract(args), pp.extract(args), args.load_iteration, args.test_iterations, args.save_iterations, args.checkpoint_iterations, args.start_checkpoint, args.debug_from)
+        s1_ress, s2_ress, pre_time, s1_time, s2_time = training_one_frame(lp.extract(args), op.extract(args), pp.extract(args), args.load_iteration, args.test_iterations, args.save_iterations, args.checkpoint_iterations, args.start_checkpoint, args.debug_from, args)
 
         # All done
         print("\nTraining complete.")
@@ -324,20 +446,78 @@ def train_frames(lp, op, pp, args):
         (item for item in sub_paths if pattern.match(item)),
         key=lambda x: int(pattern.match(x).group(1))
     )
-    frames=frames[args.frame_start:args.frame_end]
+    frames=frames[args.frame_start-1:args.frame_end]
     if args.frame_start==1:
         args.load_iteration = args.first_load_iteration
+    
+    ### Add for overall stats
+    global_psnr_sum = 0.0
+    global_l1_sum = 0.0
+    total_test_views = 0
+
     for frame in frames:
         start_time = time.time()
         args.source_path = os.path.join(video_path, frame)
         args.output_path = os.path.join(output_path, frame)
         args.model_path = model_path
-        train_one_frame(lp,op,pp,args)
+        ##train_one_frame(lp,op,pp,args)
+        res = train_one_frame(lp, op, pp, args)
+        if 'stage2/psnr_0' in res:
+            global_psnr_sum += res['stage2/psnr_0']
+            total_test_views += 1
+            print(f"[GLOBAL] Accumulated PSNR: {global_psnr_sum:.3f} over {total_test_views} frames")
+
+
         print(f"Frame {frame} finished in {time.time()-start_time} seconds.")
         model_path = args.output_path
         args.load_iteration = load_iteration
         torch.cuda.empty_cache()
-        
+    
+    if total_test_views > 0:
+        avg_psnr = global_psnr_sum / total_test_views
+        print(f"[FINAL] Average PSNR across all frames: {avg_psnr:.3f}")
+
+import os
+import imageio
+from glob import glob
+from natsort import natsorted
+
+def create_video_from_frames(frame_dirs, image_filename, output_path, fps=10):
+    """
+    Given a list of frame directories, compile a video from image_filename.
+    """
+    images = []
+    for frame_dir in tqdm(frame_dirs, desc=f"Creating {os.path.basename(output_path)}"):
+        image_path = os.path.join(frame_dir, image_filename)
+        if os.path.isfile(image_path):
+            try:
+                img = imageio.imread(image_path)
+                images.append(img)
+            except Exception as e:
+                print(f"⚠️ Skipping {image_path}: {e}")
+        else:
+            print(f"⚠️ Missing: {image_path}")
+
+    if images:
+        imageio.mimsave(output_path, images, fps=fps)
+        print(f"✅ Saved: {output_path}")
+    else:
+        print(f"❌ No valid images found for: {output_path}")
+
+def process_all_experiments(root_dir, fps=10):
+    """
+    Recursively search for experiments under root_dir and create videos.
+    """
+    frame_dirs = natsorted(glob(os.path.join(root_dir, "frame*")))
+
+    print(f"\n🎬 Processing: {root_dir}")
+
+    for image_file, video_name in [
+        ("0_rendering1.png", "rendering1_video.mp4"),
+        ("0_rendering2.png", "rendering2_video.mp4"),
+    ]:
+        output_path = os.path.join(root_dir, video_name)
+        create_video_from_frames(frame_dirs, image_file, output_path, fps=fps)
 
 if __name__ == "__main__":
     # Set up command line argument parser
@@ -359,6 +539,19 @@ if __name__ == "__main__":
     parser.add_argument("--start_checkpoint", type=str, default = None)
     parser.add_argument("--read_config", action='store_true', default=False)
     parser.add_argument("--config_path", type=str, default = None)
+    parser.add_argument("--is_acc", action="store_true", help="If errors are accumulated")
+    parser.add_argument("--max_spawn_count", type=int, default=1, help="Max number of spawn count")
+    parser.add_argument("--min_dist", type=float, default=0.1, help="Minimum distance between masks")
+    parser.add_argument("--is_cluster", action="store_true", help="If clustering is used")
+    parser.add_argument("--cluster_eps", type=float, default=1.0, help="Epsilon for clustering")
+    parser.add_argument("--min_samples", type=int, default=10, help="Minimum samples for clustering")
+    parser.add_argument("--new_loss", action="store_true", help="If new loss is used")
+    parser.add_argument("--new_spawn", action="store_true", help="If new spawn is used")
+    parser.add_argument("--grad_spawn", action="store_true", help="If gradient spawn is used")
+    parser.add_argument("--col_mask", action="store_true", help="If color mask is used")
+    parser.add_argument("--accumulated_spawn", action="store_true", help="If accumulated spawn is used")
+    parser.add_argument("--dyn", action="store_true", help="If dynamic spawn is used")
+    print("Arguments: ", sys.argv[1:])
     args = parser.parse_args(sys.argv[1:])
     if args.output_path == "":
         args.output_path=args.model_path
@@ -371,7 +564,17 @@ if __name__ == "__main__":
     serializable_namespace = {k: v for k, v in vars(args).items() if isinstance(v, (int, float, str, bool, list, dict, tuple, type(None)))}
     json_namespace = json.dumps(serializable_namespace)
     os.makedirs(args.output_path, exist_ok = True)
+    name_of_exp.append(args.output_path)
     with open(os.path.join(args.output_path, "cfg_args.json"), 'w') as f:
         f.write(json_namespace)
+    # === Change this to your actual output path ===
+    base_output_dir = args.output_path
+
     # train_one_frame(lp,op,pp,args)
     train_frames(lp,op,pp,args)
+
+
+    # Create videos
+    process_all_experiments(base_output_dir, fps=30)
+    process_all_experiments(base_output_dir, fps=30)
+

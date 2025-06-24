@@ -1,0 +1,1 @@
+Namespace(sh_degree=1, source_path='/scratch/cvlab/home/miazga/gaussian-splatting/frame000000', model_path='./output/8e8341e4-e', images='images', depths='', resolution=-1, white_background=False, train_test_exp=False, data_device='cuda', eval=False)
