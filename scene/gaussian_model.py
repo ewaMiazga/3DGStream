@@ -628,26 +628,6 @@ class GaussianModel:
 
         return norm_diff  # shape [H, W]
 
-    def clone_subset(self, mask):
-        """
-        Returns a shallow copy of the Gaussian model containing only the points specified by the mask.
-        Assumes all attributes exist as `self._xyz`, `self._scaling`, etc.
-        """
-        from copy import deepcopy
-        subset = deepcopy(self)  # Creates a copy of the object
-
-        # Apply mask to required attributes
-        subset._xyz = self.get_xyz[mask].detach().clone().requires_grad_(True)
-        subset._scaling = self.get_scaling[mask].detach().clone().requires_grad_(True)
-        subset._rotation = self.get_rotation[mask].detach().clone().requires_grad_(True)
-        subset._features_dc = self.get_features[:, 0:1, :][mask].detach().clone().requires_grad_(True)
-        subset._features_rest = self.get_features[:, 1:, :][mask].detach().clone().requires_grad_(True)
-        subset._opacity = self.get_opacity[mask].detach().clone().requires_grad_(True)
-
-        # Set count or any other required field
-        #subset.max_gaussians = subset._xyz.shape[0]
-
-        return subset
 
     def spawn_points_color_distance_function(self, gt_image, image, i, viewpoint_cam, visibility_filter, name_of_exp, training_args, args):
         import os
@@ -964,6 +944,165 @@ class GaussianModel:
         highest_spawn_count_idx = spawn_counts.argmax().item()
         #print(f"Distance for the highest spawn count gaussians after both filters: {distance_map_norm[y_pix[final_indices[highest_spawn_count_idx]], x_pix[final_indices[highest_spawn_count_idx]]].item()}")
         return selected_pts_mask, spawn_counts, old_xyz
+
+    def spawn_points_color_distance_multiview(
+        self, gt_images, images, cams, masked_i, visibility_filter, name_of_exp, training_args, args
+    ):
+        """
+        Args:
+            gt_images: list of [H, W, 3] ground truth images (Torch or NumPy)
+            images: list of [H, W, 3] predicted images
+            cams: list of COLMAP-style camera objects with .full_proj_transform, .image_width, .image_height
+        """
+        import torch
+        import numpy as np
+
+        num_views = len(gt_images)
+        assert len(images) == len(cams) == num_views
+
+        old_xyz = self.get_xyz.clone() 
+
+        # Initialize scores
+        aggregated_error = torch.zeros(self.get_xyz.shape[0], device=self.get_xyz.device)
+        aggregated_counts = torch.zeros_like(aggregated_error)
+
+        print(f"Number of views: {num_views}")
+
+        for i in range(num_views):
+            # Step 1: compute per-view distance map
+            distance_map = self.compute_distance_map(gt_images[i], images[i], threshold=0.2)  # [H, W]
+
+            # Step 2: project Gaussians to this view
+            x_pix, y_pix = self.project_xyz_to_screen(self.get_xyz, cams[i])  # [N]
+
+            H, W = distance_map.shape
+            mask_valid = (x_pix >= 0) & (x_pix < W) & (y_pix >= 0) & (y_pix < H)
+            x_valid = x_pix[mask_valid]
+            y_valid = y_pix[mask_valid]
+            gaussian_indices = torch.nonzero(mask_valid, as_tuple=False).squeeze(1)
+
+            # Step 3: assign errors from this view
+            view_errors = distance_map[y_valid, x_valid]  # [M]
+            aggregated_error[gaussian_indices] += view_errors
+            aggregated_counts[gaussian_indices] += 1
+
+        # Step 4: average error across views
+        valid = aggregated_counts > 0
+        aggregated_error[valid] /= aggregated_counts[valid]
+
+        # Step 5: spawn mask based on error
+        spawn_mask = aggregated_error.clone()
+        spawn_mask[spawn_mask < 0.1] = 0.0  # Or threshold adaptively
+
+        # Step 1: Project Gaussians to the selected view
+        x_pix, y_pix = self.project_xyz_to_screen(self.get_xyz, cams[0])  # [N]
+
+        # Step 2: Clamp coordinates and build valid mask
+        H, W = gt_images[0].shape[-2:]  # use shape of a ground truth image
+        mask_valid = (x_pix >= 0) & (x_pix < W) & (y_pix >= 0) & (y_pix < H)
+        mask_nonzero = spawn_mask > 0  # [N]
+        mask_total = mask_valid & mask_nonzero  # [N]
+        x_valid = x_pix[mask_total]
+        y_valid = y_pix[mask_total]
+        valid_errors = spawn_mask[mask_total]  # [M]
+
+        # Step 3: Normalize error values (optional but recommended)
+        valid_errors_norm = (valid_errors - valid_errors.min()) / (valid_errors.max() - valid_errors.min() + 1e-6)
+
+
+        # Step 4: Create a blank heatmap and fill with values at projected positions
+        heatmap = torch.zeros((H, W), dtype=torch.float32, device=spawn_mask.device)
+        heatmap[y_valid, x_valid] = valid_errors_norm
+
+        # Step 5: Mask out zero values for cleaner visualization
+        heatmap[heatmap == 0] = float('nan')
+
+        # Step 6: Convert to NumPy and plot
+        heatmap_np = heatmap.detach().cpu().numpy()
+        os.makedirs(f"{name_of_exp[0]}/output_dist_maps", exist_ok=True)
+
+        plt.figure(figsize=(6, 6))
+        plt.axis('off')
+        im = plt.imshow(heatmap_np, cmap='hot', interpolation='nearest')
+        plt.colorbar(im, fraction=0.046, pad=0.04)
+        plt.tight_layout()
+        plt.savefig(f"{name_of_exp[0]}/output_dist_maps/{masked_i}_aggregated_error_heatmap.png", bbox_inches='tight', pad_inches=0)
+        plt.close()
+
+
+        final_indices = spawn_mask.nonzero(as_tuple=False).squeeze(1)
+        selected_pts_mask = torch.zeros_like(spawn_mask, dtype=torch.bool)
+        selected_pts_mask[final_indices] = True
+
+        # Use the same spawn logic you already have:
+        spawn_counts = (1 + aggregated_error[final_indices] * args.max_spawn_count).round().long()
+
+        selected_xyz = self.get_xyz[final_indices]
+        selected_scaling = self.get_scaling[final_indices]
+        selected_rotation = self.get_rotation[final_indices]
+        selected_feat_dc = self.get_features[:, 0:1, :][final_indices]
+        selected_feat_rest = self.get_features[:, 1:, :][final_indices]
+
+        if spawn_counts.sum().item() == 0:
+            print("No Gaussians to spawn after filtering. Spawning one randomly.")
+
+            # === Random spawn fallback ===
+            random_index = torch.randint(0, self.get_xyz.shape[0], (1,), device=self.get_xyz.device)
+            selected_xyz = self.get_xyz[random_index]
+            selected_scaling = self.get_scaling[random_index]
+            selected_rotation = self.get_rotation[random_index]
+            selected_feat_dc = self.get_features[:, 0:1, :][random_index]
+            selected_feat_rest = self.get_features[:, 1:, :][random_index]
+
+            # Spawn one Gaussian with random perturbation
+            stds = training_args.std_scale * selected_scaling
+            samples = torch.normal(mean=torch.zeros_like(stds), std=stds)
+            rots = build_rotation(selected_rotation)
+            new_xyz = (torch.bmm(rots, samples.unsqueeze(-1)).squeeze(-1) + selected_xyz).detach().requires_grad_(True)
+
+            self._added_xyz = new_xyz
+            self._added_scaling = self.scaling_inverse_activation(selected_scaling / (0.8 * args.max_spawn_count)).detach().requires_grad_(True)
+            self._added_rotation = torch.tensor([[1., 0., 0., 0.]], device='cuda').detach().requires_grad_(True)
+            self._added_features_dc = selected_feat_dc.detach().requires_grad_(True)
+            self._added_features_rest = selected_feat_rest.detach().requires_grad_(True)
+            self._added_opacity = self.inverse_opacity_activation(torch.tensor([0.1], device='cuda')).unsqueeze(0).detach().requires_grad_(True)
+
+            return torch.zeros_like(spawn_counts, dtype=torch.bool, device=self.get_xyz.device)
+
+        xyz_base = selected_xyz.repeat_interleave(spawn_counts, dim=0)
+        scaling_base = selected_scaling.repeat_interleave(spawn_counts, dim=0)
+        rotation_base = selected_rotation.repeat_interleave(spawn_counts, dim=0)
+        feat_dc_base = selected_feat_dc.repeat_interleave(spawn_counts, dim=0)
+        feat_rest_base = selected_feat_rest.repeat_interleave(spawn_counts, dim=0)
+
+        stds = training_args.std_scale * scaling_base
+        samples = torch.normal(mean=torch.zeros_like(stds), std=stds)
+        rots = build_rotation(rotation_base)
+        new_xyz = (torch.bmm(rots, samples.unsqueeze(-1)).squeeze(-1) + xyz_base).detach().requires_grad_(True)
+        #print(f"[SPAWN] New XYZ shape: {new_xyz.shape}")
+
+        total_spawns = spawn_counts.sum().item()
+        self._added_xyz = new_xyz
+        self._added_scaling = self.scaling_inverse_activation(scaling_base / (0.8 * args.max_spawn_count)).detach().requires_grad_(True)
+        self._added_rotation = torch.tensor([1., 0., 0., 0.], device='cuda').repeat(total_spawns, 1).detach().requires_grad_(True)
+        self._added_features_dc = feat_dc_base.detach().requires_grad_(True)
+        self._added_features_rest = feat_rest_base.detach().requires_grad_(True)
+        self._added_opacity = self.inverse_opacity_activation(torch.tensor([0.1], device='cuda')).repeat(total_spawns, 1).detach().requires_grad_(True)
+        #print(f"Shape of added_opacities: {self._added_opacity.shape}")
+
+        percentage = 100 * final_indices.shape[0] / len(self.get_xyz)
+        print(f"[SPAWN] Selected Gaussians: {final_indices.shape[0]}/{len(self.get_xyz)} ({percentage:.2f}%), New Gaussians Spawned: {total_spawns}")
+        #print(f"Top distance found: {distance_map_norm[y_pix[final_indices], x_pix[final_indices]].max().item()}")
+        # indentify idx of highest spawn count gaussian
+        #highest_spawn_count_idx = spawn_counts.argmax().item()
+        #print(f"Distance for the highest spawn count gaussians after both filters: {distance_map_norm[y_pix[final_indices[highest_spawn_count_idx]], x_pix[final_indices[highest_spawn_count_idx]]].item()}")
+
+        self.save_distance_map_visualizations(
+            distance_map, x_pix, y_pix, masked_i, name_of_exp
+        )
+        return selected_pts_mask, spawn_counts, old_xyz
+    
+
 
     def save_distance_map_visualizations(self, distance_map_norm, x_pix, y_pix, i, name_of_exp):
         import os
@@ -1378,94 +1517,21 @@ class GaussianModel:
                 # self._added_opacity = (self._opacity[selected_pts_mask].repeat(num_of_spawn,1)).detach().requires_grad_(True)
 
 
-            ### NEW SPAWNING CODE #### based on magnitude of gradients
-            # Filter points based on threshold and mask
-            # selected_pts_mask = torch.where(torch.norm(grads, dim=-1) >= training_args.densify_grad_threshold, True, False)
-            # selected_pts_mask = torch.logical_and(selected_pts_mask, mask)
-
-
-            # ###### exclude points which are in already densly populated regions
-            # # Get positions of selected Gaussians (high grad & visible)
-            # selected_xyz = self.get_xyz[selected_pts_mask]  # [N, 3]
-
-            # if selected_xyz.shape[0] > 0:
-            #     # Build KD-tree from all Gaussians
-            #     all_xyz_np = self.get_xyz.detach().cpu().numpy()
-            #     tree = cKDTree(all_xyz_np)
-
-            #     # Query how many Gaussians are within a radius for each selected point
-            #     selected_xyz_np = selected_xyz.detach().cpu().numpy()
-            #     radius = 0.02  # world units; adjust as needed
-            #     local_density = torch.tensor([len(tree.query_ball_point(x, radius)) for x in selected_xyz_np], device=self.get_xyz.device)
-
-            #     # Set a density threshold (high value => over-reconstructed)
-            #     max_allowed_density = 50
-            #     density_mask = local_density <= max_allowed_density  # True where we want to keep
-
-            #     # === Step 3: Rebuild full mask with density filter ===
-            #     # Create a full mask of same shape as selected_pts_mask
-            #     full_density_mask = torch.zeros_like(selected_pts_mask)
-            #     selected_indices = selected_pts_mask.nonzero(as_tuple=False).squeeze(1)
-            #     full_density_mask[selected_indices[density_mask]] = True
-
-            #     # Final selected mask
-            #     selected_pts_mask = torch.logical_and(selected_pts_mask, full_density_mask)
-            # else:
-            #     print("No points passed initial grad/visibility filter")
-
-            # ##### End of this code #####
-            # selected_xyz = self.get_xyz[selected_pts_mask]
-            # selected_scaling = self.get_scaling[selected_pts_mask]
-            # selected_rotation = self.get_rotation[selected_pts_mask]
-            # selected_feat_dc = self.get_features[:, 0:1, :][selected_pts_mask]
-            # selected_feat_rest = self.get_features[:, 1:, :][selected_pts_mask]
-
-            # # Quadratic spawn count
-            # max_spawns = 50
-            # min_spawns = 1
-            # # Compute normalized gradient magnitudes
-            # grads_norm = torch.norm(grads[selected_pts_mask], dim=-1)  # [N]
-            # grads_norm = grads_norm / (grads_norm.max() + 1e-8) 
-            # spawn_factors = (min_spawns + (max_spawns - min_spawns) * grads_norm.pow(2)).round().long()
-            # spawn_factors = torch.round(spawn_factors).long()
-
-            # # Repeat relevant tensors based on spawn counts
-            # repeats = spawn_factors
-            # total_spawns = repeats.sum().item()
-            # repeats = repeats.squeeze(-1)
-            # #print("repeats", repeats)
-
-            # xyz_base = selected_xyz.repeat_interleave(repeats, dim=0)
-            # scaling_base = selected_scaling.repeat_interleave(repeats, dim=0)
-            # rotation_base = selected_rotation.repeat_interleave(repeats, dim=0)
-            # feat_dc_base = selected_feat_dc.repeat_interleave(repeats, dim=0)
-            # feat_rest_base = selected_feat_rest.repeat_interleave(repeats, dim=0)
-
-            # # Apply Gaussian sampling offset
-            # stds = training_args.std_scale * scaling_base
-            # samples = torch.normal(mean=torch.zeros_like(stds), std=stds)
-            # rots = build_rotation(rotation_base)
-            # new_xyz = (torch.bmm(rots, samples.unsqueeze(-1)).squeeze(-1) + xyz_base).detach().requires_grad_(True)
-
-            # # Assign attributes
-            # self._added_xyz = new_xyz
-            # self._added_scaling = self.scaling_inverse_activation(scaling_base / (0.8 * max_spawns)).detach().requires_grad_(True)
-            # self._added_rotation = torch.tensor([1., 0., 0., 0.], device='cuda').repeat(total_spawns, 1).detach().requires_grad_(True)
-            # self._added_features_dc = feat_dc_base.detach().requires_grad_(True)
-            # self._added_features_rest = feat_rest_base.detach().requires_grad_(True)
-            # self._added_opacity = self.inverse_opacity_activation(torch.tensor([0.1], device='cuda')).repeat(total_spawns, 1).detach().requires_grad_(True)
-
-            # print(f"[SPAWN] Total points selected: {selected_pts_mask.sum().item()}")
-            # print(f"[SPAWN] Total new Gaussians spawned: {total_spawns}")
-
-
-            #####
             ##### New Spawning code dependent on color distance #####
             elif args.new_spawn and args.grad_spawn:
                 selected_pts_mask, selected_spawn_counts, old_xyz = self.spawn_points_gradient_based(grads, training_args, mask=mask, max_spawn_count=args.max_spawn_count)
             elif args.new_spawn and not args.grad_spawn and args.dyn:
-                selected_pts_mask, selected_spawn_counts, old_xyz = self.spawn_points_color_distance_function(gt_image, image, i, viewpoint_cam, visibility_filter, name_of_exp, training_args, args)
+                # Spawn dyn from color distance  - works
+                #selected_pts_mask, selected_spawn_counts, old_xyz = self.spawn_points_color_distance_function(gt_image, image, i, viewpoint_cam, visibility_filter, name_of_exp, training_args, args)
+                
+                # spawn constant from distance - works
                 #selected_pts_mask, selected_spawn_counts, old_xyz = self.spawn_constant_from_distance(gt_image, image, viewpoint_cam, i, name_of_exp, training_args, args)
+                
+                # Spawn dyn from mutliview:
+                selected_pts_mask, selected_spawn_counts, old_xyz = self.spawn_points_color_distance_multiview(
+                                    gt_image, image, viewpoint_cam, i, visibility_filter, name_of_exp, training_args, args)
+
+
             # elif args.new_spawn and args.accumulated_spawn:
             #     selected_pts_mask, selected_spawn_counts, old_xyz = self.spawn_gaussians_by_error(self, gt_image, image, viewpoint_cam, training_args, args, i, name_of_exp, visibility_filter)
                    
@@ -1473,110 +1539,11 @@ class GaussianModel:
             #####
 
             if args.col_mask:
-                selected_pts_mask, selected_spawn_counts, old_xyz = self.extract_errorful_gaussians_from_diff_map(gt_image, image, viewpoint_cam, args)
+                random_idx = torch.randint(0, len(gt_image), (1,))
+                selected_pts_mask, selected_spawn_counts, old_xyz = self.extract_errorful_gaussians_from_diff_map(gt_image[random_idx], image[random_idx], viewpoint_cam[random_idx], args)
 
 
-
-            #### Calculate clustering centers for loss patches ####
-            #### Mine Ewa
-
-            # 2. Filter top-k% Gaussians by gradient magnitude (e.g., top 10%) choose only from selected_pts
             
-            # # based on grads
-            #selected_grad_norms = grads[selected_pts_mask]
-            #top_percent = 1.0
-            #k = int(top_percent * selected_grad_norms.numel())
-            #topk_vals, topk_indices = torch.topk(selected_grad_norms.flatten(), k)
-            #topk_xyz = self.get_xyz[topk_indices]  # [k, 3]
-
-            if args.is_cluster:
-
-                # # Based on what is returned by # self.spawn_points_color_distance_function
-                top_xyz = old_xyz[selected_pts_mask]  # [N, 3]
-
-                # 3. Cluster using DBSCAN (or k-means) to find dense gradient regions
-                # Convert to NumPy for sklearn
-                topk_xyz_np = top_xyz.detach().cpu().numpy()
-
-                # Tune `eps` to adjust neighborhood size (in world units)
-                #training_args.cluster_eps = 5  # epsilon indicate # maximum distance between two samples for one to be considered as in the neighborhood of the other
-                #training_args.min_samples = 10  # Minimum points to form a cluster
-                clustering = DBSCAN(eps=args.cluster_eps, min_samples=args.min_samples).fit(topk_xyz_np)
-                labels = clustering.labels_
-
-                # 4. Choose largest cluster and compute its center
-                unique_labels, counts = torch.tensor(labels).unique(return_counts=True)
-                valid = unique_labels[unique_labels >= 0]
-                print(f"Number of points in total: {top_xyz.shape[0]}, valid clusters: {len(valid)}")
-                #print(f"Number of points in each cluster: {counts[valid]}")
-                print(f"Number of points in largest cluster: {counts[valid].max().item() if len(valid) > 0 else 0}")
-                if len(valid) > 0:
-                    # biggest found
-                    # print(f"Found largest")
-                    # largest_cluster_label = valid[torch.argmax(counts[valid])]
-                    # cluster_mask = torch.tensor(labels) == largest_cluster_label
-                    # cluster_center = topk_xyz[cluster_mask].mean(dim=0)
-
-                    # Sort valid clusters by size
-                    sorted_indices = torch.argsort(counts[valid], descending=True)
-                    top_labels = valid[sorted_indices]  # top-5 cluster labels
-
-                    cluster_centers = []
-                    for label in top_labels:
-                        cluster_mask = torch.tensor(labels) == label
-                        cluster_center = top_xyz[cluster_mask].mean(dim=0)
-                        cluster_centers.append(cluster_center)
-
-                    cluster_centers = torch.stack(cluster_centers)  # shape: [N <= 5, 3]
-                else:
-                    # Fallback: use average of top-k
-                    #cluster_center = topk_xyz.mean(dim=0)
-                    # Fallback: replicate mean as 5 fake clusters
-                    cluster_centers = top_xyz.mean(dim=0, keepdim=True).repeat(len(valid), 1)
-
-                def filter_distant_centers(cluster_centers, counts, min_dist, top_k):
-                    """
-                    Args:
-                        cluster_centers: [N, 3] Tensor of cluster centers
-                        counts: [N] Tensor with cluster sizes
-                        min_dist: float, minimum distance between selected centers
-                        top_k: int, maximum number of centers to select
-
-                    Returns:
-                        selected_centers: [<=top_k, 3] Tensor of filtered centers
-                    """
-                    selected = []
-                    used_mask = torch.zeros(len(cluster_centers), dtype=torch.bool, device=cluster_centers.device)
-
-                    # Sort indices by descending counts
-                    sorted_indices = torch.argsort(counts, descending=True)
-
-                    for idx in sorted_indices:
-                        if used_mask[idx]:
-                            continue
-                        center = cluster_centers[idx]
-                        selected.append(center)
-
-                        # Mark centers too close as used
-                        dists = torch.norm(cluster_centers - center, dim=1)
-                        used_mask |= dists < min_dist
-
-                        if len(selected) >= top_k:
-                            break
-
-                    if selected:
-                        return torch.stack(selected)
-                    else:
-                        return cluster_centers[:top_k]  # fallback
-
-                # Example use:
-                final_centers = filter_distant_centers(cluster_centers, counts[valid], args.min_dist, top_k=5)
-
-                #self.max_gaussian_xyz = cluster_center  # final result
-                print(f"Shape of cluster centers: {final_centers.shape}")
-                self.max_gaussian_xyzs = final_centers #cluster_centers
-
-
             # choose 5 top points that are not close to each other
             def select_topk_spatially_diverse_points(xyz: torch.Tensor, spawn_counts: torch.Tensor, k: int = 5, min_dist: float = 0.05):
                 """

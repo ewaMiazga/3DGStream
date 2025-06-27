@@ -47,6 +47,51 @@ def render_and_save_gradients(viewpoint_cam, gaussians, i, pipe, background = to
     # Assuming `image` is [3, H, W] and values in [0, 1]
     save_image(image, f'output_dist_maps/{i}_rendered_image_grad.png')
 
+
+def get_all_viewpoints(dataset, scene, opt, pipe, background, gaussians):
+    """
+    Get all viewpoints from the dataset and render them using the provided pipeline.
+    """
+    # Prepare lists to store all outputs
+    rendered_images = []
+    depth_maps = []
+    ground_truth_images = []
+    camera_list = []
+    visibility_filters = []
+    viewspace_points_list = []
+    radii_list = []
+
+    # Get all train cameras
+    viewpoint_cams = scene.getTrainCameras()
+    viewpoint_stack = viewpoint_cams.copy()  # Copy to preserve the original list
+
+    # Loop through all available viewpoints
+    for cam in viewpoint_stack:
+        # Render current view
+        render_pkg = render(cam, gaussians, pipe, background)
+
+        # Extract rendered outputs
+        image = render_pkg["render"]
+        depth = render_pkg["depth"]
+        viewspace_points = render_pkg["viewspace_points"]
+        visibility_filter = render_pkg["visibility_filter"]
+        radii = render_pkg["radii"]
+
+        # Get ground truth image for this camera (if available)
+        gt_img = cam.original_image.cuda()
+
+        # Append everything to lists
+        rendered_images.append(image)
+        depth_maps.append(depth)
+        viewspace_points_list.append(viewspace_points)
+        visibility_filters.append(visibility_filter)
+        radii_list.append(radii)
+        ground_truth_images.append(gt_img)
+        camera_list.append(cam)
+
+    return rendered_images, depth_maps, ground_truth_images, camera_list, visibility_filters, viewspace_points_list, radii_list
+
+
 def training_one_frame(dataset, opt, pipe, load_iteration, testing_iterations, saving_iterations, checkpoint_iterations, checkpoint, debug_from, args):
     global masked_i
     masked_i += 1
@@ -171,7 +216,8 @@ def training_one_frame(dataset, opt, pipe, load_iteration, testing_iterations, s
         # render_and_save_gradients(viewpoint_cam, masked_gaus, masked_i, pipe, background)
 
         #print(f"Mean of xyz gaussians before setup: {gaussians.xyz_gradient_accum.mean(dim=0)}") ### != 0 
-        gaussians.training_one_frame_s2_setup(gt_image, image, masked_i, viewpoint_cam, visibility_filter, name_of_exp, pipe, opt, args)
+        rendered_images, depth_maps, ground_truth_images, camera_list, visibility_filters, viewspace_points_list, radii_list = get_all_viewpoints(dataset, scene, opt, pipe, background, gaussians)
+        gaussians.training_one_frame_s2_setup(ground_truth_images, rendered_images, masked_i, camera_list, visibility_filters, name_of_exp, pipe, opt, args)
         #print(f"Mean of xyz gaussians after setup: {gaussians.xyz_gradient_accum.mean(dim=0)}")
         progress_bar = tqdm(range(opt.iterations, opt.iterations + opt.iterations_s2), desc="Training progress of Stage 2")    
     

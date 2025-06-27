@@ -84,8 +84,8 @@ if multiple_runs:
     
 else:
     #run_name = "spawn-100-acc-False_minDist-15_cluster-False"
-    run_name = "0.2-spawn500-dyn-color-spawn-300iter-new-loss-color-map-min-dist-1-col-mask-undist"
-    output_dir = f"output/Thursday/{run_name}"
+    run_name = "0.2-spawn500-dyn-color-spawn-multiview-300iter-new-loss-color-map-min-dist-1-col-mask-thre-0.1-try-full"
+    output_dir = f"output/26.06.2025/{run_name}"
     #output_dir = f"output/Monday/{run_name}"
     os.makedirs(output_dir, exist_ok=True)
 
